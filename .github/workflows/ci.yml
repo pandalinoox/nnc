@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: |
+          find src include tests benchmarks examples -type f \( -name '*.c' -o -name '*.h' \) \
+            -print0 | xargs -0 -r clang-format --dry-run --Werror
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config clang-tidy \
+            ocl-icd-opencl-dev opencl-headers
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DNNC_BUILD_TESTS=OFF \
+            -DNNC_WITH_OPENCL=ON
+
+      - name: Run clang-tidy
+        run: |
+          find src -type f -name '*.c' -print0 | xargs -0 -r clang-tidy -p build
+
+  test:
+    name: Test (OpenCL ${{ matrix.opencl }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        opencl: ["ON", "OFF"]
+    env:
+      NNC_REQUIRE_OPENCL: ${{ matrix.opencl == 'ON' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config libcriterion-dev \
+            ocl-icd-opencl-dev opencl-headers pocl-opencl-icd
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DNNC_WITH_OPENCL=${{ matrix.opencl }} \
+            -DNNC_WERROR=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=ignore
+
+  sanitize:
+    name: Test (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    env:
+      ASAN_OPTIONS: detect_leaks=0
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config libcriterion-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DNNC_WITH_OPENCL=OFF \
+            -DNNC_SANITIZE=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=ignore
+
+  install:
+    name: Install + consume
+    runs-on: ubuntu-24.04
+    env:
+      PREFIX: ${{ github.workspace }}/nnc-install
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config ocl-icd-opencl-dev opencl-headers
+
+      - name: Build and install the library
+        if: hashFiles('src/**/*.c') != ''
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DNNC_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      - name: Build a consumer with find_package
+        if: hashFiles('src/**/*.c') != ''
+        run: |
+          cmake -S examples/consumer -B build-consumer -DCMAKE_PREFIX_PATH="$PREFIX"
+          cmake --build build-consumer
+
+      - name: Build a consumer with pkg-config
+        if: hashFiles('src/**/*.c') != ''
+        run: |
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          cc examples/consumer/main.c $(pkg-config --cflags --libs nnc) -o consumer-pc

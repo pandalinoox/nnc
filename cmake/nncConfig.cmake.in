@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+set(nnc_WITH_OPENCL @NNC_WITH_OPENCL@)
+
+if(nnc_WITH_OPENCL)
+    find_dependency(OpenCL 3.0)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/nncTargets.cmake")
+
+check_required_components(nnc)
